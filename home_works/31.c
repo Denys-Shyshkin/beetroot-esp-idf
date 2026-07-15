@@ -1,3 +1,9 @@
+/**
+ *  Урок 31
+ *  Модуль 3.2.
+ *  Домашнє завдання
+ *  Проста ковзна середня (SMA)
+ */
 #include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_log.h"
