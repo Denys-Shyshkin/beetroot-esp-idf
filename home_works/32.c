@@ -1,3 +1,9 @@
+/**
+ *  Урок 32
+ *  Модуль 3.3.
+ *  Домашнє завдання
+ *  Широтно Імпульсна Модуляція (PWM)
+ */
 #include "driver/ledc.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_log.h"
