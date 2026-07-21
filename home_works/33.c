@@ -1,3 +1,9 @@
+/**
+ *  Урок 33
+ *  Модуль 3.4.
+ *  Домашнє завдання
+ *  Програвання звуку на зумері (PWM)
+ */
 #include "driver/ledc.h"
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
