@@ -1,157 +1,120 @@
-#include "driver/ledc.h"
-#include "esp_err.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+#include <math.h>
+#include <stdbool.h>
 #include <stdio.h>
 
-#define BUZZER_GPIO 4
-#define LEDC_TIMER LEDC_TIMER_0
-#define LEDC_MODE LEDC_LOW_SPEED_MODE
-#define LEDC_CHANNEL LEDC_CHANNEL_0
-#define LEDC_DUTY_RES LEDC_TIMER_10_BIT
-#define LEDC_FREQUENCY 2700
-#define DUTY 512
-#define DURATION_TO_GAP_RATIO 1.3
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
 
-// Notes frequencies list
-#define REST 0
-#define NOTE_C4 262
-#define NOTE_D4 294
-#define NOTE_E4 330
-#define NOTE_F4 349
-#define NOTE_G4 392
-#define NOTE_A4 440
-#define NOTE_B4 494
-#define NOTE_C5 523
+#include "servo.h"
 
-// Notes duration list
-#define WHOLE 800
-#define HALF 400
-#define QUARTER 200
-#define EIGHTH 100
+static const char *TAG = "SERVO";
 
-typedef struct {
-    uint16_t freq;
-    uint16_t duration;
-} note_t;
+#define BUTTON_1 GPIO_NUM_4
+#define BUTTON_2 GPIO_NUM_5
 
-const note_t baby_shark[] = {
-    {NOTE_C4, QUARTER}, {NOTE_D4, QUARTER}, {NOTE_E4, HALF},    
-    {NOTE_C4, QUARTER}, {NOTE_D4, QUARTER}, {NOTE_E4, HALF},
-    {NOTE_C4, QUARTER}, {NOTE_D4, QUARTER}, {NOTE_E4, HALF},
-};
+#define LOG_PERIOD_US 500000
+#define BUTTON_DEBOUNCE_US 50000
 
-const note_t jingle_bells[] = {
-    {NOTE_E4, QUARTER}, {NOTE_E4, QUARTER}, {NOTE_E4, HALF},    
-    {NOTE_E4, QUARTER}, {NOTE_E4, QUARTER}, {NOTE_E4, HALF},
-    {NOTE_E4, QUARTER}, {NOTE_G4, QUARTER}, {NOTE_C4, QUARTER}, {NOTE_D4, QUARTER}, {NOTE_E4, WHOLE}
-};
+#define ANGLE_STEP 10
 
-const note_t we_will_rock_you[] = {
-    {NOTE_C4, EIGHTH}, {NOTE_C4, EIGHTH}, {NOTE_D4, QUARTER}, {REST, QUARTER},
-    {NOTE_C4, EIGHTH}, {NOTE_C4, EIGHTH}, {NOTE_D4, QUARTER}, {REST, QUARTER},
-    {NOTE_C4, EIGHTH}, {NOTE_C4, EIGHTH}, {NOTE_D4, QUARTER}, {NOTE_E4, HALF}
-};
+static uint64_t s_last_log = 0;
+static uint64_t s_last_btn_1_pressed = 0;
+static uint64_t s_last_btn_2_pressed = 0;
 
-const note_t twinkle_little_star[] = {
-    {NOTE_C4, QUARTER}, {NOTE_C4, QUARTER}, {NOTE_G4, QUARTER}, {NOTE_G4, QUARTER},
-    {NOTE_A4, QUARTER}, {NOTE_A4, QUARTER}, {NOTE_G4, HALF},
-};
+static bool btn_1_state = 1;
+static bool btn_2_state = 1;
 
-#define NOTE_LEN sizeof(note_t)
+static bool is_btn_1_pressed = 1;
+static bool is_btn_2_pressed = 1;
 
-enum MELODIES {
-    BABY_SHARK,
-    JINGLE_BELLS,
-    WE_WILL_ROCK_YOU,
-    TWINKLE_LITTLE_STAR,
-};
+static bool last_btn_1_state = 1;
+static bool last_btn_2_state = 1;
 
-uint8_t melody_to_play = TWINKLE_LITTLE_STAR;
+int16_t servo_angle = 90;
 
-void buzzer_init();
-void tone_on(uint16_t freq);
-void tone_off();
-void play_note(uint16_t freq, uint16_t duration);
-void play_melody(const note_t melody[], uint8_t length);
+static void button_init(gpio_num_t gpio) {
+    gpio_config_t io_config = {
+        .pin_bit_mask = 1ULL << gpio,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_config);
+}
+
+static bool get_is_button_pressed(gpio_num_t gpio, bool *btn_state, bool *last_btn_state, uint64_t *s_last_btn_pressed) {
+    int64_t now = esp_timer_get_time();
+
+    bool button_read = gpio_get_level(gpio);
+
+    if (button_read != *last_btn_state) {
+        *s_last_btn_pressed = now;
+    }
+
+    if (now - *s_last_btn_pressed >= BUTTON_DEBOUNCE_US) {
+        if (button_read != *btn_state) {
+            *btn_state = button_read;
+
+            if (button_read == 0) {
+                return true;
+            }
+        }
+    }
+
+    *last_btn_state = button_read;
+
+    return false;
+}
+
+static void buttons_reading() {
+    is_btn_1_pressed = get_is_button_pressed(BUTTON_1, &btn_1_state, &last_btn_1_state, &s_last_btn_1_pressed);
+    is_btn_2_pressed = get_is_button_pressed(BUTTON_2, &btn_2_state, &last_btn_2_state, &s_last_btn_2_pressed);
+}
+
+static void servo_control_update(void) {
+    if (is_btn_1_pressed) {
+        servo_angle += ANGLE_STEP;
+    } 
+    if (is_btn_2_pressed) {
+        servo_angle -= ANGLE_STEP;
+    }
+
+    if (servo_angle > 180) {
+        servo_angle = 180;
+    }
+    if (servo_angle < 0) {
+        servo_angle = 0;
+    }
+
+    servo_write_angle(servo_angle);
+}
+
+static void log_update(void) {
+    int64_t now = esp_timer_get_time();
+
+    if (now - s_last_log >= LOG_PERIOD_US) {
+        s_last_log = now;
+
+        ESP_LOGI(TAG, "Current servo angle: %d \n", servo_angle);
+    }
+}
+
 
 void app_main(void) {
-    buzzer_init();
+    servo_init();
+
+    button_init(BUTTON_1);
+    button_init(BUTTON_2);
 
     while (1) {
-        switch (melody_to_play) {
-        case BABY_SHARK:
-            play_melody(baby_shark, sizeof(baby_shark) / NOTE_LEN);
-            break;
-        case JINGLE_BELLS:
-            play_melody(jingle_bells, sizeof(jingle_bells) / NOTE_LEN);
-            break;
-        case WE_WILL_ROCK_YOU:
-            play_melody(we_will_rock_you, sizeof(we_will_rock_you) / NOTE_LEN);
-            break;
-        case TWINKLE_LITTLE_STAR:
-            play_melody(twinkle_little_star, sizeof(twinkle_little_star) / NOTE_LEN);
-            break;
-        
-        default:
-            play_melody(baby_shark, sizeof(baby_shark) / NOTE_LEN);
-            break;
-        }
+        buttons_reading();
+        servo_control_update();
+        log_update();
 
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-}
-
-void buzzer_init() {
-    ledc_timer_config_t t = {
-        .speed_mode = LEDC_MODE,
-        .timer_num = LEDC_TIMER,
-        .duty_resolution = LEDC_DUTY_RES,
-        .freq_hz = LEDC_FREQUENCY,
-        .clk_cfg = LEDC_AUTO_CLK,
-    };
-    ESP_ERROR_CHECK(ledc_timer_config(&t));
-
-    ledc_channel_config_t c = {
-        .gpio_num = BUZZER_GPIO,
-        .speed_mode = LEDC_MODE,
-        .channel = LEDC_CHANNEL,
-        .timer_sel = LEDC_TIMER,
-        .intr_type = LEDC_INTR_DISABLE,
-        .duty = 0,
-        .hpoint = 0,
-    };
-    ESP_ERROR_CHECK(ledc_channel_config(&c));
-}
-
-void tone_on(uint16_t freq) {
-    ledc_set_freq(LEDC_MODE, LEDC_TIMER, freq);
-    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, DUTY);
-    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
-}
-
-void tone_off() {
-    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, 0);
-    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
-}
-
-void play_note(uint16_t freq, uint16_t duration) {
-    uint16_t gap = duration * DURATION_TO_GAP_RATIO;
-
-    if (freq == REST) {
-        tone_off();
-        vTaskDelay(pdMS_TO_TICKS(duration));
-    } else {
-        tone_on(freq);
-        vTaskDelay(pdMS_TO_TICKS(duration));
-
-        tone_off();
-        vTaskDelay(pdMS_TO_TICKS(gap));
-    }
-}
-
-void play_melody(const note_t melody[], uint8_t length) {
-    for (int i = 0; i < length; i++) {
-        play_note(melody[i].freq, melody[i].duration);
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
