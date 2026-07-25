@@ -1,7 +1,6 @@
 #include "servo.h"
 #include "driver/ledc.h"
 
-#define SERVO_GPIO 18
 #define SERVO_TIMER LEDC_TIMER_0
 #define SERVO_CHANNEL LEDC_CHANNEL_0
 #define SERVO_MODE LEDC_LOW_SPEED_MODE
@@ -14,7 +13,7 @@
 
 static float s_cur_angle = 90.0f;
 
-void servo_init(void) {
+void servo_init(uint8_t gpio_num) {
     ledc_timer_config_t timer_cfg = {
         .speed_mode = SERVO_MODE,
         .duty_resolution = SERVO_RES,
@@ -25,7 +24,7 @@ void servo_init(void) {
     ledc_timer_config(&timer_cfg);
 
     ledc_channel_config_t ch_cfg = {
-        .gpio_num = SERVO_GPIO,
+        .gpio_num = gpio_num,
         .speed_mode = SERVO_MODE,
         .channel = SERVO_CHANNEL,
         .intr_type = LEDC_INTR_DISABLE,
