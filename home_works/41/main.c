@@ -1,9 +1,9 @@
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_timer.h"
-#include <esp_log.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #define I2C_PORT I2C_NUM_0
 #define I2C_SDA_GPIO GPIO_NUM_4
