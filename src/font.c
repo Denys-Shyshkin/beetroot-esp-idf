@@ -1,11 +1,10 @@
-#include "font5x7.h"
-#include "ssd1306.h"
+#include "font.h"
+#include <stdint.h>
 
-#include <stdarg.h>
-#include <stdio.h>
+#define FONT_FIRST_CHAR ' '
+#define FONT_LAST_CHAR 'Z'
 
-
-static const uint8_t FONT[][5] = {
+static const uint8_t font_table[][FONT_WIDTH] = {
     {0x00,0x00,0x00,0x00,0x00}, /*   */ {0x00,0x00,0x5F,0x00,0x00}, /* ! */
     {0x00,0x07,0x00,0x07,0x00}, /* " */ {0x14,0x7F,0x14,0x7F,0x14}, /* # */
     {0x24,0x2A,0x7F,0x2A,0x12}, /* $ */ {0x23,0x13,0x08,0x64,0x62}, /* % */
@@ -38,38 +37,10 @@ static const uint8_t FONT[][5] = {
     {0x61,0x51,0x49,0x45,0x43}, /* Z */
 };
 
-#define FONT_FIRST 0x20
-#define FONT_LAST  0x5A
-
-static void draw_char(int x, int y, char ch)
-{
-    if (ch >= 'a' && ch <= 'z') ch -= 32;         
-    if (ch < FONT_FIRST || ch > FONT_LAST) ch = '?';
-
-    const uint8_t *g = FONT[(uint8_t)ch - FONT_FIRST];
-
-    for (int col = 0; col < 5; col++) {
-        uint8_t bits = g[col];
-        for (int row = 0; row < 7; row++) {
-            if (bits & (1u << row)) fb_pixel(x + col, y + row, true);
-        }
+const uint8_t *font_get_glyph(char c) {
+    if (c < FONT_FIRST_CHAR || c > FONT_LAST_CHAR) {
+        return NULL;
+    } else {
+        return font_table[c - FONT_FIRST_CHAR];
     }
-}
-
-void fb_text(int x, int y, const char *s)
-{
-    while (*s) {
-        draw_char(x, y, *s++);
-        x += 6;                                     
-    }
-}
-
-void fb_printf(int x, int y, const char *fmt, ...)
-{
-    char buf[32];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    fb_text(x, y, buf);
 }
