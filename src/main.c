@@ -1,98 +1,140 @@
-#include "clock.h"
-#include "display.h"
-#include "driver/i2c_master.h"
-#include "esp_log.h"
-#include "esp_timer.h"
-#include "font.h"
+#include "driver/uart.h"
+#include "driver/uhci.h"
+#include "esp_adc/adc_continuous.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "i2c.h"
-#include "sensor.h"
-#include "spi.h"
+#include <stdint.h>
 
-#define UPDATE_DISPLAY_TIME_INTERVAL_US 1000000
+#define POT_CHANNEL ADC_CHANNEL_3 // GPIO 4 is ADC1_3
+#define ADC_UNIT ADC_UNIT_1
+#define ADC_ATTEN ADC_ATTEN_DB_12
+#define ADC_BIT_WIDTH SOC_ADC_DIGI_MAX_BITWIDTH
+#define ADC_CONV_MODE ADC_CONV_SINGLE_UNIT_1
+#define ADC_FORMAT ADC_DIGI_OUTPUT_FORMAT_TYPE2
+#define ADC_SAMPLE_RATE_HZ 5000
+
+#define DMA_BUFFER_SIZE 256
+#define DMA_MAX_BUF 4096
+#define DMA_RESULT_BYTES SOC_ADC_DIGI_RESULT_BYTES
+#define SAMPLES_PER_FRAME (DMA_BUFFER_SIZE / DMA_RESULT_BYTES)
+
+// Serial monitor, to see hex values add "monitor_filters = hexlify" to platformio.ini
+#define UART_PORT UART_NUM_0
+#define UART_BAUD_RATE 115200
+
+#define TX_SAMPLES 512
+
+#define UHCI_RX_MEM_SIZE 1024
+#define UHCI_DMA_BURST 32
+
 #define SUPERLOOP_DELAY_MS 10
 
 static const char *TAG = "MAIN";
 
-static int64_t last_clock_read_us = 0;
+static adc_continuous_handle_t handle;
+static uhci_controller_handle_t uhci;
 
-static const char *days[] = {"MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"};
+static uint8_t frame[DMA_BUFFER_SIZE];
 
-static void update_display_clock(void) {
-    clock_time_t current_time;
+static uint16_t buffer_a[TX_SAMPLES];
+static uint16_t buffer_b[TX_SAMPLES];
+static volatile bool uart_tx_busy = false;
 
-    esp_err_t get_time_error = clock_get_time(&current_time);
-    if (get_time_error == ESP_OK) {
-        ESP_LOGI(TAG, "Time and date: %02d:%02d:%02d | %s %02d.%02d.%04d", current_time.hour, current_time.min, current_time.sec, days[current_time.dow - 1], current_time.day, current_time.month,
-                 current_time.year);
+// Pointer to an active buffer
+static uint16_t *fill_ptr = buffer_a;
+static uint32_t fill_idx = 0;
 
-        char time_buff[20];
-        snprintf(time_buff, sizeof(time_buff), "%02d:%02d:%02d", current_time.hour, current_time.min, current_time.sec);
+static void adc_dma_init(void) {
+    adc_continuous_handle_cfg_t handle_config = {
+        .max_store_buf_size = DMA_MAX_BUF,
+        .conv_frame_size = DMA_BUFFER_SIZE,
+    };
+    ESP_ERROR_CHECK(adc_continuous_new_handle(&handle_config, &handle));
 
-        char date_buff[20];
-        snprintf(date_buff, sizeof(date_buff), "%s %02d.%02d.%04d", days[current_time.dow - 1], current_time.day, current_time.month, current_time.year);
+    adc_digi_pattern_config_t pattern = {
+        .atten = ADC_ATTEN,
+        .channel = POT_CHANNEL,
+        .unit = ADC_UNIT,
+        .bit_width = ADC_BIT_WIDTH,
+    };
 
-        esp_err_t time_error = display_show_text(1, 40, time_buff);
-        if (time_error != ESP_OK) {
-            ESP_LOGE(TAG, "Update display clock time failed");
-        }
+    adc_continuous_config_t adc_config = {
+        .pattern_num = 1,
+        .adc_pattern = &pattern,
+        .sample_freq_hz = ADC_SAMPLE_RATE_HZ,
+        .conv_mode = ADC_CONV_MODE,
+        .format = ADC_FORMAT,
+    };
+    ESP_ERROR_CHECK(adc_continuous_config(handle, &adc_config));
 
-        esp_err_t date_error = display_show_text(3, 22, date_buff);
-        if (date_error != ESP_OK) {
-            ESP_LOGE(TAG, "Update display clock date failed");
-        }
-    } else {
-        ESP_LOGE(TAG, "Update display clock failed");
-    }
+    ESP_ERROR_CHECK(adc_continuous_start(handle));
+
+    ESP_LOGI(TAG, "ADC DMA init successful");
 }
 
-static void update_display_sensor_data(void) {
-    sensor_measurements_t sensor_measurements;
+// Callback function for handling the completion of a transmission
+static bool uart_tx_done_cb(uhci_controller_handle_t ctrl, const uhci_tx_done_event_data_t *edata, void *user_ctx) {
+    uart_tx_busy = false;
+    return false;
+}
 
-    esp_err_t data_error = sensor_read_measurements(&sensor_measurements);
-    if (data_error == ESP_OK) {
-        ESP_LOGI(TAG, "Measured data: P=%d T=%d H=%d", sensor_measurements.pressure_hpa, sensor_measurements.temp_c, sensor_measurements.humidity_pct);
+static void uart_dma_init(void) {
+    uart_config_t config = {
+        .baud_rate = UART_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    ESP_ERROR_CHECK(uart_param_config(UART_PORT, &config));
 
-        char data_buff[30];
-        snprintf(data_buff, sizeof(data_buff), "%dHPA  %dC  %d%%", sensor_measurements.pressure_hpa, sensor_measurements.temp_c, sensor_measurements.humidity_pct);
+    uhci_controller_config_t uhci_config = {
+        .uart_port = UART_PORT,
+        .tx_trans_queue_depth = 1,
+        .max_transmit_size = sizeof(buffer_a),
+        .max_receive_internal_mem = UHCI_RX_MEM_SIZE,
+        .dma_burst_size = UHCI_DMA_BURST,
+    };
+    ESP_ERROR_CHECK(uhci_new_controller(&uhci_config, &uhci));
 
-        esp_err_t show_error = display_show_text(5, 16, data_buff);
-        if (show_error != ESP_OK) {
-            ESP_LOGE(TAG, "Update display sensor data failed");
-        }
-    } else {
-        ESP_LOGE(TAG, "Update display sensor data failed");
-    }
+    uhci_event_callbacks_t event_callbacks = {
+        .on_tx_trans_done = uart_tx_done_cb,
+    };
+    ESP_ERROR_CHECK(uhci_register_event_callbacks(uhci, &event_callbacks, NULL));
+
+    ESP_LOGI(TAG, "UART DMA init successful");
 }
 
 void app_main(void) {
-    // I2C bus init and devices add, config & check
-    i2c_bus_init();
-    i2c_device_config(DISPLAY_ADDRESS, &display_handle);
-    i2c_device_config(CLOCK_ADDRESS, &clock_handle);
-
-    // I2C device setup
-    display_setup();
-
-    // SPI bus init and devices add, config & check
-    spi_bus_init();
-    spi_add_device(SENSOR_SPI_CS_GPIO, &sensor_handle);
-    spi_check_device_id(sensor_handle, SENSOR_ID_REG, SENSOR_ID);
-
-    // SPI device setup
-    sensor_setup();
-
-    // Init values read / update
-    update_display_clock();
-    update_display_sensor_data();
+    adc_dma_init();
+    uart_dma_init();
 
     while (1) {
-        if (esp_timer_get_time() - last_clock_read_us >= UPDATE_DISPLAY_TIME_INTERVAL_US) {
-            update_display_clock();
-            update_display_sensor_data();
+        uint32_t length = 0;
 
-            last_clock_read_us = esp_timer_get_time();
+        while (adc_continuous_read(handle, frame, sizeof(frame), &length, 0) == ESP_OK) {
+            for (uint32_t i = 0; i < length; i += DMA_RESULT_BYTES) {
+                adc_digi_output_data_t *r = (adc_digi_output_data_t *)&frame[i];
+                if (r->type2.channel != POT_CHANNEL) {
+                    continue;
+                }
+
+                fill_ptr[fill_idx] = r->type2.data;
+                fill_idx++;
+
+                // Transfer only when the buffer is full
+                if (fill_idx >= TX_SAMPLES) {
+                    esp_err_t uart_error = uhci_transmit(uhci, (uint8_t *)fill_ptr, sizeof(buffer_a));
+                    if (uart_error == ESP_OK) {
+                        // Switch buffer
+                        fill_ptr = (fill_ptr == buffer_a) ? buffer_b : buffer_a;
+                    } else {
+                        uart_tx_busy = false;
+                    }
+                    fill_idx = 0;
+                }
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(SUPERLOOP_DELAY_MS));
